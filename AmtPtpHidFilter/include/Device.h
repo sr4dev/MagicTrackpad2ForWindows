@@ -2,6 +2,8 @@
 
 #pragma once
 
+#include "../../Common/FirstClick.h"
+
 EXTERN_C_START
 
 // {FF969022-3111-4441-8F88-875440172C2E} for the device interface
@@ -57,6 +59,20 @@ typedef struct _DEVICE_CONTEXT
     // completes. Never reset: in-flight reads survive D0 transitions and decrement
     // on completion.
     volatile LONG OutstandingTransportReads;
+    volatile LONG BufferedTransportReads;
+    KSPIN_LOCK CompletedReadLock;
+    LIST_ENTRY CompletedReads;
+    WDFWORKITEM InputWorkItem;
+    BOOLEAN InputWorkItemQueued;
+    volatile BOOLEAN InputStopping;
+    volatile LONG PowerStopping;
+    WDFWAITLOCK FirstClickLock;
+    FIRST_CLICK_PHASE FirstClickPhase;
+    BOOLEAN HostClick;
+    BOOLEAN FirstClickButtonDisabled;
+    UCHAR FirstClickPressure;
+    ULONG FirstClickFeedback;
+    ULONG FirstClickReleaseFeedback;
 
     // Device State
     BOOLEAN DeviceConfigured;
@@ -79,6 +95,10 @@ WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DEVICE_CONTEXT, PtpFilterGetContext)
 typedef struct _WORKER_REQUEST_CONTEXT {
     PDEVICE_CONTEXT DeviceContext;
     WDFMEMORY RequestMemory;
+    WDFREQUEST Request;
+    LIST_ENTRY CompletedEntry;
+    SIZE_T Length;
+    NTSTATUS Status;
 } WORKER_REQUEST_CONTEXT, * PWORKER_REQUEST_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(WORKER_REQUEST_CONTEXT, WorkerRequestGetContext)
@@ -96,6 +116,8 @@ EVT_WDF_DEVICE_D0_ENTRY PtpFilterDeviceD0Entry;
 EVT_WDF_DEVICE_D0_EXIT PtpFilterDeviceD0Exit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_INIT PtpFilterSelfManagedIoInit;
 EVT_WDF_DEVICE_SELF_MANAGED_IO_RESTART PtpFilterSelfManagedIoRestart;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_SUSPEND PtpFilterSelfManagedIoSuspend;
+EVT_WDF_DEVICE_SELF_MANAGED_IO_CLEANUP PtpFilterSelfManagedIoCleanup;
 
 // Device Management routines
 NTSTATUS
@@ -122,5 +144,23 @@ PtpFilterGetHidInputReport(
     _Out_ PUCHAR pReportBuffer,
     _In_ ULONG ReportBufferSize
 );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PtpFilterFirstClickInitialize(_In_ PDEVICE_CONTEXT Context);
+// The caller holds FirstClickLock for configuration and input processing.
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PtpFilterFirstClickApply(_In_ PDEVICE_CONTEXT Context);
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID PtpFilterFirstClickStop(_In_ PDEVICE_CONTEXT Context);
+_IRQL_requires_(PASSIVE_LEVEL)
+UCHAR PtpFilterFirstClickUpdate(_In_ PDEVICE_CONTEXT Context, _In_ UCHAR Pressure,
+    _In_ BOOLEAN HasContact, _In_ UCHAR NativeButton);
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PtpFilterSendHidFeatureReport(_In_ WDFDEVICE Device, _In_ UCHAR ReportId,
+    _In_reads_bytes_(ReportDataSize) PUCHAR ReportData, _In_ ULONG ReportDataSize);
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PtpFilterSendHidOutputReport(_In_ WDFDEVICE Device, _In_ UCHAR ReportId,
+    _In_reads_bytes_(ReportDataSize) PUCHAR ReportData, _In_ ULONG ReportDataSize);
 
 EXTERN_C_END

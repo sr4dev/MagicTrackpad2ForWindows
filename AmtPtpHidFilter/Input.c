@@ -49,7 +49,7 @@ PtpFilterInputReplenishTransportRequests(
 
 	// Only issue reads when fully configured. The recovery timer calls back here
 	// after it has reconfigured the device.
-	if (deviceContext->DeviceConfigured != TRUE) {
+	if (deviceContext->DeviceConfigured != TRUE || deviceContext->InputStopping) {
 		return;
 	}
 
@@ -65,7 +65,7 @@ PtpFilterInputReplenishTransportRequests(
 	// request.
 	WdfIoQueueGetState(deviceContext->HidReadQueue, &queuedRequests, NULL);
 	outstandingReads = deviceContext->OutstandingTransportReads;
-	deficit = (LONG) queuedRequests - outstandingReads;
+	deficit = (LONG) queuedRequests - outstandingReads - deviceContext->BufferedTransportReads;
 
 	if (deficit > 1) {
 		TraceEvents(TRACE_LEVEL_WARNING, TRACE_INPUT, "%!FUNC! Transport reads fell behind: queued = %lu, outstanding = %ld, issuing %ld",
@@ -256,6 +256,22 @@ PtpFilterInputParseMT2Report(
 		return;
 	}
 
+    UCHAR maxPressure = 0;
+    BOOLEAN hasContact = FALSE;
+    raw_n = (BufferLength - sizeof(TRACKPAD_REPORT_TYPE5)) / sizeof(TRACKPAD_FINGER_TYPE5);
+    if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
+    if (DeviceContext->PtpReportTouch) {
+        for (SIZE_T i = 0; i < raw_n; i++) {
+            f = &mt_report->Fingers[i];
+            if (f->State >= 3 && f->State <= 5 && f->Finger != 6) {
+                hasContact = TRUE;
+                if (f->Pressure > maxPressure) maxPressure = f->Pressure;
+            }
+        }
+    }
+    UCHAR button = PtpFilterFirstClickUpdate(DeviceContext,
+        maxPressure, hasContact, (UCHAR)mt_report->Button);
+
 	// Retrieve PTP output 
 	status = WdfIoQueueRetrieveNextRequest(DeviceContext->HidReadQueue, &ptpRequest);
 	if (!NT_SUCCESS(status))
@@ -272,7 +288,7 @@ PtpFilterInputParseMT2Report(
 
 	// Report header
 	ptpOutputReport.ReportID = REPORTID_MULTITOUCH;
-	ptpOutputReport.IsButtonClicked = (UCHAR) mt_report->Button;
+    ptpOutputReport.IsButtonClicked = button;
 	ptpOutputReport.ScanTime = (USHORT) timestamp * 10;
 
 	if (driverContext->ButtonDisabled)
@@ -476,54 +492,120 @@ PtpFilterInputParseReport(
 	}
 }
 
+_Use_decl_annotations_
+NTSTATUS
+PtpFilterInputInitialize(WDFDEVICE Device)
+{
+    PDEVICE_CONTEXT context = PtpFilterGetContext(Device);
+    WDF_WORKITEM_CONFIG config;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    KeInitializeSpinLock(&context->CompletedReadLock);
+    InitializeListHead(&context->CompletedReads);
+    context->InputStopping = TRUE;
+    WDF_WORKITEM_CONFIG_INIT(&config, PtpFilterInputWorkItem);
+    config.AutomaticSerialization = FALSE;
+    WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ParentObject = Device;
+    return WdfWorkItemCreate(&config, &attributes, &context->InputWorkItem);
+}
+
+_Use_decl_annotations_
+VOID
+PtpFilterInputStart(WDFDEVICE Device)
+{
+    PDEVICE_CONTEXT context = PtpFilterGetContext(Device);
+    KIRQL irql;
+    KeAcquireSpinLock(&context->CompletedReadLock, &irql);
+    if (!context->PowerStopping) {
+        context->DeviceConfigured = TRUE;
+        context->InputStopping = FALSE;
+    }
+    KeReleaseSpinLock(&context->CompletedReadLock, irql);
+}
+
+_Use_decl_annotations_
+VOID
+PtpFilterInputStop(WDFDEVICE Device)
+{
+    PDEVICE_CONTEXT context = PtpFilterGetContext(Device);
+    KIRQL irql;
+    KeAcquireSpinLock(&context->CompletedReadLock, &irql);
+    context->InputStopping = TRUE;
+    context->DeviceConfigured = FALSE;
+    KeReleaseSpinLock(&context->CompletedReadLock, irql);
+    WdfWorkItemFlush(context->InputWorkItem);
+}
+
+VOID
+PtpFilterInputWorkItem(WDFWORKITEM WorkItem)
+{
+    WDFDEVICE device = WdfWorkItemGetParentObject(WorkItem);
+    PDEVICE_CONTEXT context = PtpFilterGetContext(device);
+    for (;;) {
+        KIRQL irql;
+        KeAcquireSpinLock(&context->CompletedReadLock, &irql);
+        if (IsListEmpty(&context->CompletedReads)) {
+            context->InputWorkItemQueued = FALSE;
+            KeReleaseSpinLock(&context->CompletedReadLock, irql);
+            return;
+        }
+        PLIST_ENTRY entry = RemoveHeadList(&context->CompletedReads);
+        KeReleaseSpinLock(&context->CompletedReadLock, irql);
+        PWORKER_REQUEST_CONTEXT packet = CONTAINING_RECORD(entry, WORKER_REQUEST_CONTEXT, CompletedEntry);
+        WDFREQUEST request = packet->Request;
+        WDFMEMORY memory = packet->RequestMemory;
+        WdfWaitLockAcquire(context->FirstClickLock, NULL);
+        if (!context->InputStopping && !context->PowerStopping && context->DeviceConfigured) {
+            SIZE_T capacity;
+            PUCHAR buffer = WdfMemoryGetBuffer(memory, &capacity);
+            if (NT_SUCCESS(packet->Status) && packet->Length > 0 && packet->Length <= capacity) {
+                PtpFilterInputParseReport(buffer, packet->Length, context);
+            }
+            else {
+                WdfTimerStart(context->HidTransportRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(3));
+            }
+        }
+        WdfWaitLockRelease(context->FirstClickLock);
+        WdfObjectDelete(memory);
+        WdfObjectDelete(request);
+        InterlockedDecrement(&context->BufferedTransportReads);
+        PtpFilterInputReplenishTransportRequests(device);
+    }
+}
+
 VOID
 PtpFilterInputRequestCompletionCallback(
-	_In_ WDFREQUEST Request,
-	_In_ WDFIOTARGET Target,
-	_In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
-	_In_ WDFCONTEXT Context
+    _In_ WDFREQUEST Request,
+    _In_ WDFIOTARGET Target,
+    _In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
+    _In_ WDFCONTEXT Context
 )
 {
-	PWORKER_REQUEST_CONTEXT requestContext;
-	PDEVICE_CONTEXT deviceContext;
+    PWORKER_REQUEST_CONTEXT packet = (PWORKER_REQUEST_CONTEXT)Context;
+    PDEVICE_CONTEXT context = packet->DeviceContext;
+    WDFMEMORY memory = packet->RequestMemory;
+    KIRQL irql;
+    BOOLEAN queued = FALSE;
+    UNREFERENCED_PARAMETER(Target);
 
-	size_t responseLength;
-	PUCHAR responseBuffer;
-
-	UNREFERENCED_PARAMETER(Target);
-	
-	requestContext = (PWORKER_REQUEST_CONTEXT)Context;
-	deviceContext = requestContext->DeviceContext;
-
-	// This read is no longer in flight. Decrement first so a replenish triggered from
-	// this routine (recovery work item) sees the right count.
-	InterlockedDecrement(&deviceContext->OutstandingTransportReads);
-
-	responseLength = (size_t)(LONG)WdfRequestGetInformation(Request);
-	responseBuffer = WdfMemoryGetBuffer(Params->Parameters.Ioctl.Output.Buffer, NULL);
-
-	// Pre-flight check 0: Right now we only have Magic Trackpad 2 (BT and USB)
-	if (deviceContext->VendorID != HID_VID_APPLE_USB && deviceContext->VendorID != HID_VID_APPLE_BT) {
-		TraceEvents(TRACE_LEVEL_ERROR, TRACE_INPUT, "%!FUNC! Unsupported device entered this routine");
-		WdfDeviceSetFailed(deviceContext->Device, WdfDeviceFailedNoRestart);
-		goto cleanup;
-	}
-
-	// Pre-flight check 1: if size is 0, this is not something we need. Ignore the read, and issue next request.
-	if (responseLength <= 0) {
-		WdfWorkItemEnqueue(requestContext->DeviceContext->HidTransportRecoveryWorkItem);
-		goto cleanup;
-	}
-
-	PtpFilterInputParseReport(responseBuffer, responseLength, deviceContext);
-
-cleanup:
-	// Cleanup
-	WdfObjectDelete(Request);
-	if (requestContext->RequestMemory != NULL) {
-		WdfObjectDelete(requestContext->RequestMemory);
-	}
-
-	// We don't issue new request here (unless it's a spurious request - which is handled earlier) to
-	// keep the request pipe go through one-way.
+    InterlockedIncrement(&context->BufferedTransportReads);
+    InterlockedDecrement(&context->OutstandingTransportReads);
+    packet->Request = Request;
+    packet->Length = WdfRequestGetInformation(Request);
+    packet->Status = Params->IoStatus.Status;
+    KeAcquireSpinLock(&context->CompletedReadLock, &irql);
+    if (!context->InputStopping) {
+        InsertTailList(&context->CompletedReads, &packet->CompletedEntry);
+        queued = TRUE;
+        if (!context->InputWorkItemQueued) {
+            context->InputWorkItemQueued = TRUE;
+            WdfWorkItemEnqueue(context->InputWorkItem);
+        }
+    }
+    KeReleaseSpinLock(&context->CompletedReadLock, irql);
+    if (!queued) {
+        WdfObjectDelete(memory);
+        WdfObjectDelete(Request);
+        InterlockedDecrement(&context->BufferedTransportReads);
+    }
 }

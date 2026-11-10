@@ -26,6 +26,7 @@ typedef struct _DRIVER_CONTEXT {
 	BOOLEAN PalmRejection;
 	ULONG FeedbackClick;
 	ULONG FeedbackRelease;
+	ULONG FirstClickPressure;
 } DRIVER_CONTEXT, *PDRIVER_CONTEXT;
 
 WDF_DECLARE_CONTEXT_TYPE_WITH_NAME(DRIVER_CONTEXT, PtpFilterDriverGetContext)

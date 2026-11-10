@@ -52,6 +52,8 @@ AmtPtpConfigContReaderForInterruptEndPoint(
 	);
 
 	contReaderConfig.EvtUsbTargetPipeReadersFailed = AmtPtpEvtUsbInterruptReadersFailed;
+	if (DeviceContext->DeviceInfo->tp_type == TYPE5)
+		contReaderConfig.NumPendingReads = 1;
 
 	// Remember to turn it on in D0 entry
 	status = WdfUsbTargetPipeConfigContinuousReader(
@@ -487,6 +489,44 @@ AmtPtpServiceTouchInputInterruptType5(
 	UINT timestamp;
 	INT x, y = 0;
 	size_t raw_n, i = 0;
+	UCHAR maxPressure = 0;
+	BOOL hasContact = FALSE;
+	LONG generation = InterlockedCompareExchange(&DeviceContext->SettingsGeneration, 0, 0);
+
+	full_report = (const struct TRACKPAD_COMBINED_REPORT_TYPE5*)Buffer;
+	mt_report = &full_report->MTReport;
+	raw_n = (NumBytesTransferred - sizeof(struct TRACKPAD_COMBINED_REPORT_TYPE5)) / sizeof(struct TRACKPAD_FINGER_TYPE5);
+	if (raw_n > PTP_MAX_CONTACT_POINTS) raw_n = PTP_MAX_CONTACT_POINTS;
+
+	if (!DeviceContext->PrevPtpReportAuxAndSettingsInited || generation != DeviceContext->AppliedSettingsGeneration)
+	{
+		DeviceContext->PrevPtpReportAuxAndSettingsInited = TRUE;
+		DeviceContext->AppliedSettingsGeneration = generation;
+		DeviceContext->PrevPtpReportAux1.Id = (UINT32)-1;
+		DeviceContext->PrevPtpReportAux2.Id = (UINT32)-1;
+		DeviceContext->PrevPtpReportAux1.TipSwitch = 0;
+		DeviceContext->PrevPtpReportAux2.TipSwitch = 0;
+		DeviceContext->PrevIsButtonClicked = 0;
+		DeviceContext->ButtonDisabled = ReadSettingValue(L"ButtonDisabled", 0) ? TRUE : FALSE;
+		DeviceContext->StopPressure = ReadSettingValue(L"StopPressure", 0);
+		DeviceContext->StopSize = ReadSettingValue(L"StopSize", 0xffffffff);
+		DeviceContext->IgnoreButtonFinger = ReadSettingValue(L"IgnoreButtonFinger", 1) ? TRUE : FALSE;
+		DeviceContext->IgnoreNearFingers = ReadSettingValue(L"IgnoreNearFingers", 1) ? TRUE : FALSE;
+		DeviceContext->PalmRejection = ReadSettingValue(L"PalmRejection", 0) ? TRUE : FALSE;
+	}
+
+	if (DeviceContext->IsSurfaceReportOn) {
+		for (i = 0; i < raw_n; i++) {
+			f = &mt_report->Fingers[i];
+			if (f->State >= 3 && f->State <= 5 && f->Finger != 6) {
+				hasContact = TRUE;
+				if (f->Pressure > maxPressure) maxPressure = f->Pressure;
+			}
+		}
+	}
+
+	PtpReport.IsButtonClicked = AmtPtpFirstClickUpdate(DeviceContext, maxPressure,
+		hasContact, (UCHAR)mt_report->Button);
 
 	Status = WdfIoQueueRetrieveNextRequest(
 		DeviceContext->InputQueue,
@@ -516,33 +556,11 @@ AmtPtpServiceTouchInputInterruptType5(
 		goto exit;
 	}
 
-	full_report = (const struct TRACKPAD_COMBINED_REPORT_TYPE5 *) Buffer;
-	mt_report = &full_report->MTReport;
-
 	timestamp = (mt_report->TimestampHigh << 5) | mt_report->TimestampLow;
 	PtpReport.ScanTime = (USHORT) timestamp * 10;
-	PtpReport.IsButtonClicked = (UCHAR) mt_report->Button;
-
-	if (!DeviceContext->PrevPtpReportAuxAndSettingsInited)
-	{
-		DeviceContext->PrevPtpReportAuxAndSettingsInited = TRUE;
-		DeviceContext->PrevPtpReportAux1.Id = (UINT32)-1;
-		DeviceContext->PrevPtpReportAux2.Id = (UINT32)-1;
-		DeviceContext->ButtonDisabled = ReadSettingValue(L"ButtonDisabled", 0) ? TRUE : FALSE;
-		DeviceContext->StopPressure = ReadSettingValue(L"StopPressure", 0);
-		DeviceContext->StopSize = ReadSettingValue(L"StopSize", 0xffffffff);
-		DeviceContext->IgnoreButtonFinger = ReadSettingValue(L"IgnoreButtonFinger", 1) ? TRUE : FALSE;
-		DeviceContext->IgnoreNearFingers = ReadSettingValue(L"IgnoreNearFingers", 1) ? TRUE : FALSE;
-		DeviceContext->PalmRejection = ReadSettingValue(L"PalmRejection", 0) ? TRUE : FALSE;
-	}
-
-	if (DeviceContext->ButtonDisabled)
-		PtpReport.IsButtonClicked = 0;
 
 	// Type 5 finger report
 	if (DeviceContext->IsSurfaceReportOn) {
-		raw_n = (NumBytesTransferred - sizeof(struct TRACKPAD_REPORT_TYPE5)) / sizeof(struct TRACKPAD_FINGER_TYPE5);
-
 		// Release pointer-lock state for slots that are not in this frame. A locked slot
 		// (Id with the MSB set) is normally released by a later frame that still carries
 		// the slot with TipSwitch clear. If the contact simply disappears (Bluetooth packet
@@ -617,8 +635,8 @@ AmtPtpServiceTouchInputInterruptType5(
 				DeviceContext->PrevPtpReportAux1.Id != UINT32_SET_MSB(f->Id) &&
 				DeviceContext->PrevPtpReportAux2.Id != UINT32_SET_MSB(f->Id) &&
 				(DeviceContext->IgnoreButtonFinger == FALSE ? TRUE : (!DeviceContext->PrevIsButtonClicked || !PtpReport.IsButtonClicked)) &&
-				(DeviceContext->StopPressure == 0xffffffff ? TRUE : f->Pressure > DeviceContext->StopPressure) &&
-				(DeviceContext->StopSize == 0xffffffff ? TRUE : f->Size > DeviceContext->StopSize)
+					(DeviceContext->StopPressure == 0xffffffff ? TRUE : f->Pressure > DeviceContext->StopPressure) &&
+					(DeviceContext->StopSize == 0xffffffff ? TRUE : f->Size > DeviceContext->StopSize)
 			)
 			{
 				PPTP_REPORT_AUX contact;

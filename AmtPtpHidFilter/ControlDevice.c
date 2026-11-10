@@ -34,8 +34,18 @@ PtpFilterEvtIoDeviceControl(
 			TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! CDFirstDevice == NULL");
 			status = STATUS_INVALID_DEVICE_STATE;
 		} else {
-			PtpFilterReadSettings(driverContext);
-			PtpFilterSetHapticFeedback(driverContext->CDFirstDevice, driverContext->FeedbackClick, driverContext->FeedbackRelease);
+            PDEVICE_CONTEXT context = PtpFilterGetContext(driverContext->CDFirstDevice);
+            if (context->PowerStopping || !context->DeviceConfigured) {
+                status = STATUS_DEVICE_NOT_READY;
+                break;
+            }
+            WdfWaitLockAcquire(context->FirstClickLock, NULL);
+            if (context->DeviceConfigured && !context->PowerStopping) {
+                PtpFilterReadSettings(driverContext);
+                status = PtpFilterFirstClickApply(context);
+            }
+            else status = STATUS_DEVICE_NOT_READY;
+            WdfWaitLockRelease(context->FirstClickLock);
 		}
         break;
 		
@@ -44,6 +54,11 @@ PtpFilterEvtIoDeviceControl(
 			TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! CDFirstDevice == NULL");
 			status = STATUS_INVALID_DEVICE_STATE;
 		} else {
+			PDEVICE_CONTEXT context = PtpFilterGetContext(driverContext->CDFirstDevice);
+			if (context->PowerStopping || !context->DeviceConfigured) {
+				status = STATUS_DEVICE_NOT_READY;
+				break;
+			}
 			BYTE mt2Battery[64] = { 0 };
 			status = PtpFilterGetHidInputReport(driverContext->CDFirstDevice, 0x90, mt2Battery, sizeof(mt2Battery));
 			if (!NT_SUCCESS(status)) {
@@ -138,6 +153,7 @@ PtpFilterCreateControlDevice(
     }
 
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
+    attributes.ExecutionLevel = WdfExecutionLevelPassive;
     status = WdfDeviceCreate(&deviceInit, &attributes, &controlDevice);
     if (!NT_SUCCESS(status)) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DRIVER, 
@@ -179,6 +195,7 @@ PtpFilterDeleteControlDevice(
 
     if (driverContext->ControlDevice != NULL) {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DRIVER, "Deleting Control Device");
+        WdfIoQueuePurgeSynchronously(WdfDeviceGetDefaultQueue(driverContext->ControlDevice));
         WdfObjectDelete(driverContext->ControlDevice);
         driverContext->ControlDevice = NULL;
     }

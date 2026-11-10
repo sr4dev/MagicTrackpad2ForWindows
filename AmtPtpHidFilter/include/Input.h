@@ -35,3 +35,11 @@ PtpFilterInputRequestCompletionCallback(
 	_In_ PWDF_REQUEST_COMPLETION_PARAMS Params,
 	_In_ WDFCONTEXT Context
 );
+
+_IRQL_requires_(PASSIVE_LEVEL)
+NTSTATUS PtpFilterInputInitialize(_In_ WDFDEVICE Device);
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID PtpFilterInputStart(_In_ WDFDEVICE Device);
+_IRQL_requires_(PASSIVE_LEVEL)
+VOID PtpFilterInputStop(_In_ WDFDEVICE Device);
+EVT_WDF_WORKITEM PtpFilterInputWorkItem;

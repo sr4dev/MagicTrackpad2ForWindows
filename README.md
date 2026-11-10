@@ -1,4 +1,14 @@
-# Magic Trackpad 2 Precision Touchpad driver for Windows 11, signed by Microsoft, no more hacks required 🎉
+# Magic Trackpad 2 first-click pressure fork
+
+This branch adds adjustable first-click pressure with matching haptic feedback over USB and Bluetooth.
+See [First-click pressure](docs/first-click-pressure.md) for settings and validation limits, and [Build the first-click drivers](docs/build-first-click.md) for build instructions.
+
+This is a source fork based on upstream commit `e558ba2255e362143516fdbee63c82bfe835789f`.
+Modified binaries require new signatures. The upstream signed releases described below do not include this change.
+
+## Upstream project
+
+### Magic Trackpad 2 Precision Touchpad driver for Windows 11, signed by Microsoft, no more hacks required 🎉
 
 This is a fork of the excellent [imbushuo](https://github.com/imbushuo/mac-precision-touchpad) driver for the Magic Trackpad 2. **It supports Bluetooth**. Compared to imbushuo or to the official 2021 Apple driver, this project adds:
 

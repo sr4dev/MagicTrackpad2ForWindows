@@ -78,6 +78,8 @@ AmtPtpCreateDevice(
 	// run under framework verifier mode.
 	//
 	deviceContext = DeviceGetContext(device);
+	status = AmtPtpFirstClickInitialize(deviceContext);
+	if (!NT_SUCCESS(status)) return status;
 
 	//
 	// Tell the framework to set the SurpriseRemovalOK in the DeviceCaps so
@@ -771,6 +773,8 @@ AmtPtpEvtDeviceD0Entry(
 
 	pDeviceContext = DeviceGetContext(Device);
 	isTargetStarted = FALSE;
+	InterlockedIncrement(&pDeviceContext->SettingsGeneration);
+	InterlockedExchange(&pDeviceContext->FirstClickStatus, 0);
 
 	TraceEvents(
 		TRACE_LEVEL_INFORMATION, 
@@ -805,6 +809,9 @@ AmtPtpEvtDeviceD0Entry(
 	//
 	// Start the control panel pipe server for the user-mode client.
 	//
+	if (AmtPtpIsMagicTrackpad2(pDeviceContext)) {
+		AmtPtpFirstClickApply(pDeviceContext);
+	}
 	status = AmtPtpControlPanelPipeStart(pDeviceContext);
 	if (!NT_SUCCESS(status)) {
 		TraceEvents(
@@ -846,6 +853,7 @@ End:
 		// does not outlive the device context.
 		//
 		AmtPtpControlPanelPipeStop(pDeviceContext);
+		AmtPtpFirstClickStop(pDeviceContext);
 
 		//
 		// Failure in D0Entry will lead to device being removed. So let us stop the continuous
@@ -899,6 +907,7 @@ AmtPtpEvtDeviceD0Exit(
 		pDeviceContext->InterruptPipe),
 		WdfIoTargetCancelSentIo
 	);
+	AmtPtpFirstClickStop(pDeviceContext);
 
 	// Cancel Wellspring mode.
 	TraceEvents(

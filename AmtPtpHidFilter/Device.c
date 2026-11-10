@@ -3,8 +3,11 @@
 #include <Driver.h>
 #include "Device.tmh"
 
+static VOID PtpFilterStopInput(WDFDEVICE Device);
+
 #ifdef ALLOC_PRAGMA
 #pragma alloc_text (PAGE, PtpFilterCreateDevice)
+#pragma alloc_text (PAGE, PtpFilterSendHidOutputReport)
 #endif
 
 VOID
@@ -52,6 +55,8 @@ PtpFilterCreateDevice(
     pnpPowerCallbacks.EvtDeviceD0Exit = PtpFilterDeviceD0Exit;
     pnpPowerCallbacks.EvtDeviceSelfManagedIoInit = PtpFilterSelfManagedIoInit;
     pnpPowerCallbacks.EvtDeviceSelfManagedIoRestart = PtpFilterSelfManagedIoRestart;
+    pnpPowerCallbacks.EvtDeviceSelfManagedIoSuspend = PtpFilterSelfManagedIoSuspend;
+    pnpPowerCallbacks.EvtDeviceSelfManagedIoCleanup = PtpFilterSelfManagedIoCleanup;
     WdfDeviceInitSetPnpPowerEventCallbacks(DeviceInit, &pnpPowerCallbacks);
 
     // Create WDF device object
@@ -66,6 +71,10 @@ PtpFilterCreateDevice(
     // Initialize context and interface
     deviceContext = PtpFilterGetContext(device);
     deviceContext->Device = device;
+    status = PtpFilterFirstClickInitialize(deviceContext);
+    if (!NT_SUCCESS(status)) goto exit;
+    status = PtpFilterInputInitialize(device);
+    if (!NT_SUCCESS(status)) goto exit;
     deviceContext->WdmDeviceObject = WdfDeviceWdmGetDeviceObject(device);
     if (deviceContext->WdmDeviceObject == NULL) {
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "WdfDeviceWdmGetDeviceObject failed");
@@ -187,7 +196,7 @@ PtpFilterDeviceD0Entry(
     NTSTATUS status = STATUS_SUCCESS;
 
     PAGED_CODE();
-    UNREFERENCED_PARAMETER(Device);
+    InterlockedExchange(&PtpFilterGetContext(Device)->PowerStopping, 0);
     UNREFERENCED_PARAMETER(PreviousState);
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Entry");
 
@@ -211,8 +220,7 @@ PtpFilterDeviceD0Exit(
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Entry");
     deviceContext = PtpFilterGetContext(Device);
 
-    // Reset device state
-    deviceContext->DeviceConfigured = FALSE;
+    PtpFilterStopInput(Device);
 
     // Cancelling all outstanding requests
     while (NT_SUCCESS(status)) {
@@ -286,7 +294,7 @@ PtpFilterSelfManagedIoInit(
     KeQueryPerformanceCounter(&deviceContext->LastReportTime);
 
     // Set device state
-    deviceContext->DeviceConfigured = TRUE;
+    PtpFilterInputStart(Device);
 
 exit:
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Exit, Status = %!STATUS!", status);
@@ -306,13 +314,15 @@ PtpFilterSelfManagedIoRestart(
     deviceContext = PtpFilterGetContext(Device);
 
     // If this is first D0, it will be done in self-managed IO init.
+    if (deviceContext->PowerStopping) return STATUS_DEVICE_NOT_READY;
     if (deviceContext->IsHidIoDetourCompleted) {
         status = PtpFilterConfigureMultiTouch(Device);
         if (!NT_SUCCESS(status)) {
             TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! PtpFilterConfigureMultiTouch failed, Status = %!STATUS!", status);
             // If this failed, we will retry after 2 seconds (and pretend nothing happens)
             status = STATUS_SUCCESS;
-            WdfTimerStart(deviceContext->HidTransportRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(2));
+            if (!deviceContext->PowerStopping)
+                WdfTimerStart(deviceContext->HidTransportRecoveryTimer, WDF_REL_TIMEOUT_IN_SEC(2));
             goto exit;
         }
     }
@@ -326,7 +336,7 @@ PtpFilterSelfManagedIoRestart(
     KeQueryPerformanceCounter(&deviceContext->LastReportTime);
 
     // Set device state
-    deviceContext->DeviceConfigured = TRUE;
+    PtpFilterInputStart(Device);
 
 exit:
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Exit, Status = %!STATUS!", status);
@@ -424,13 +434,18 @@ PtpFilterGetHidInputReport(
 
     // Send synchronously
     WDF_REQUEST_SEND_OPTIONS sendOptions;
-    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_SYNCHRONOUS);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions,
+        WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&sendOptions, WDF_REL_TIMEOUT_IN_MS(500));
 
     if (!WdfRequestSend(request, deviceContext->HidIoTarget, &sendOptions)) {
         status = WdfRequestGetStatus(request);
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfRequestSend failed: %!STATUS!", status);
         goto Exit;
     }
+
+    status = WdfRequestGetStatus(request);
+    if (!NT_SUCCESS(status)) goto Exit;
 
     // Copy response back to caller
     if (pHidPacket->reportBufferLen > ReportBufferSize) {
@@ -445,6 +460,7 @@ PtpFilterGetHidInputReport(
 
 Exit:
 	if (pMDL != NULL) {
+		WdfRequestWdmGetIrp(request)->MdlAddress = NULL;
 		IoFreeMdl(pMDL);
 	}
     if (request != NULL) {
@@ -455,113 +471,64 @@ Exit:
     return status;
 }
 
-NTSTATUS
-PtpFilterSendHidFeatureReport(
-    _In_ WDFDEVICE Device,
-    _In_ UCHAR ReportId,
-    _In_ PUCHAR pReportData,
-    _In_ ULONG ReportDataSize
-    )
+static NTSTATUS
+PtpFilterSendHidReport(WDFDEVICE Device, ULONG Ioctl, UCHAR ReportId,
+    PUCHAR ReportData, ULONG ReportDataSize)
 {
-    NTSTATUS status = STATUS_SUCCESS;
-    PDEVICE_CONTEXT deviceContext = NULL;
+    PDEVICE_CONTEXT context = PtpFilterGetContext(Device);
     WDFREQUEST request = NULL;
-    WDFMEMORY memory = NULL;
-    PHID_XFER_PACKET pHidPacket = NULL;
-    ULONG totalBufferSize = 0;
-    PUCHAR pAllocatedBuffer = NULL;
-	WDF_OBJECT_ATTRIBUTES attributes;
-
-    PAGED_CODE();
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Entry: ReportId=0x%02x, DataSize=%lu", ReportId, ReportDataSize);
-
-    if (Device == NULL || pReportData == NULL) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! Invalid parameter");
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    deviceContext = PtpFilterGetContext(Device);
-
-    // Total buffer = ReportId (1 byte) + payload
-    totalBufferSize = 1 + ReportDataSize;
-
-    // Allocate request
-    status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, deviceContext->HidIoTarget, &request);
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfRequestCreate failed: %!STATUS!", status);
-        goto Exit;
-    }
-
-    // Allocate buffer for HID_XFER_PACKET + report data
+    WDFMEMORY memory;
+    WDF_OBJECT_ATTRIBUTES attributes;
+    WDF_REQUEST_SEND_OPTIONS options;
+    struct {
+        HID_XFER_PACKET Packet;
+        UCHAR Report[HID_XFER_PACKET_SIZE];
+    } *buffer;
+    if (ReportDataSize > HID_XFER_PACKET_SIZE - 1) return STATUS_INVALID_BUFFER_SIZE;
+    NTSTATUS status = WdfRequestCreate(WDF_NO_OBJECT_ATTRIBUTES, context->HidIoTarget, &request);
+    if (!NT_SUCCESS(status)) return status;
     WDF_OBJECT_ATTRIBUTES_INIT(&attributes);
     attributes.ParentObject = request;
-    status = WdfMemoryCreate(&attributes,
-                             NonPagedPoolNx,
-                             0,
-                             sizeof(HID_XFER_PACKET) + totalBufferSize,
-                             &memory,
-                             (PVOID*)&pAllocatedBuffer);
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfMemoryCreate failed: %!STATUS!", status);
-        goto Exit;
-    }
-
-    // Layout: [HID_XFER_PACKET][ReportId][Payload...]
-    pHidPacket = (PHID_XFER_PACKET)pAllocatedBuffer;
-    PUCHAR pReportBuffer = pAllocatedBuffer + sizeof(HID_XFER_PACKET);
-
-    // Build the report buffer
-    pReportBuffer[0] = ReportId;
-    if (ReportDataSize > 0) {
-        RtlCopyMemory(&pReportBuffer[1], pReportData, ReportDataSize);
-    }
-
-    // Initialize HID_XFER_PACKET
-    RtlZeroMemory(pHidPacket, sizeof(HID_XFER_PACKET));
-    pHidPacket->reportId = ReportId;
-    pHidPacket->reportBuffer = pReportBuffer;
-    pHidPacket->reportBufferLen = totalBufferSize; // Include ReportId byte
-
-    // Format request
-    status = WdfIoTargetFormatRequestForInternalIoctl(
-        deviceContext->HidIoTarget,
-        request,
-        IOCTL_HID_SET_FEATURE,
-        memory,     // Input buffer (report)
-        NULL,       // Output buffer
-        NULL, NULL);
-    if (!NT_SUCCESS(status)) {
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfIoTargetFormatRequestForInternalIoctl failed: %!STATUS!", status);
-        goto Exit;
-    }
-
-    PIRP irp = WdfRequestWdmGetIrp(request);
-    if (irp == NULL) {
-        status = STATUS_UNSUCCESSFUL;
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfRequestWdmGetIrp failed");
-        goto Exit;
-    }
-    irp->UserBuffer = pHidPacket;
-
-    // Send synchronously
-    WDF_REQUEST_SEND_OPTIONS sendOptions;
-    WDF_REQUEST_SEND_OPTIONS_INIT(&sendOptions, WDF_REQUEST_SEND_OPTION_SYNCHRONOUS);
-
-    if (!WdfRequestSend(request, deviceContext->HidIoTarget, &sendOptions)) {
-        status = WdfRequestGetStatus(request);
-        TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfRequestSend failed: %!STATUS!", status);
-        goto Exit;
-    }
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Custom feature report sent successfully");
-
-Exit:
-    if (request != NULL) {
-        WdfObjectDelete(request);
-    }
-
-    TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Exit: %!STATUS!", status);
+    status = WdfMemoryCreate(&attributes, NonPagedPoolNx, 0,
+        sizeof(*buffer), &memory, (PVOID*)&buffer);
+    if (!NT_SUCCESS(status)) goto exit;
+    PHID_XFER_PACKET packet = &buffer->Packet;
+    RtlZeroMemory(packet, sizeof(*packet));
+    packet->reportId = ReportId;
+    packet->reportBuffer = buffer->Report;
+    packet->reportBufferLen = 1 + ReportDataSize;
+    packet->reportBuffer[0] = ReportId;
+    RtlCopyMemory(packet->reportBuffer + 1, ReportData, ReportDataSize);
+    status = WdfIoTargetFormatRequestForInternalIoctl(context->HidIoTarget,
+        request, Ioctl, memory, NULL, NULL, NULL);
+    if (!NT_SUCCESS(status)) goto exit;
+    WdfRequestWdmGetIrp(request)->UserBuffer = packet;
+    WDF_REQUEST_SEND_OPTIONS_INIT(&options,
+        WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&options, WDF_REL_TIMEOUT_IN_MS(500));
+    WdfRequestSend(request, context->HidIoTarget, &options);
+    status = WdfRequestGetStatus(request);
+exit:
+    WdfObjectDelete(request);
     return status;
+}
+
+_Use_decl_annotations_
+NTSTATUS
+PtpFilterSendHidFeatureReport(WDFDEVICE Device, UCHAR ReportId,
+    PUCHAR ReportData, ULONG ReportDataSize)
+{
+    PAGED_CODE();
+    return PtpFilterSendHidReport(Device, IOCTL_HID_SET_FEATURE, ReportId, ReportData, ReportDataSize);
+}
+
+_Use_decl_annotations_
+NTSTATUS
+PtpFilterSendHidOutputReport(WDFDEVICE Device, UCHAR ReportId,
+    PUCHAR ReportData, ULONG ReportDataSize)
+{
+    PAGED_CODE();
+    return PtpFilterSendHidReport(Device, IOCTL_HID_WRITE_REPORT, ReportId, ReportData, ReportDataSize);
 }
 
 NTSTATUS
@@ -623,7 +590,12 @@ PtpFilterConfigureMultiTouch(
 
     PAGED_CODE();
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Entry");
-    deviceContext = PtpFilterGetContext(Device); 
+    deviceContext = PtpFilterGetContext(Device);
+    WdfWaitLockAcquire(deviceContext->FirstClickLock, NULL);
+    if (deviceContext->PowerStopping) {
+        status = STATUS_DEVICE_NOT_READY;
+        goto exit;
+    }
     
     // Check if this device is supported for configuration.
     // So far in this prototype, we support Magic Trackpad 2 in USB (05AC:0265) or Bluetooth mode (004c:0265)
@@ -641,7 +613,7 @@ PtpFilterConfigureMultiTouch(
     if (deviceContext->VendorID == HID_VID_APPLE_BT) {
 		driverContext = PtpFilterDriverGetContext(WdfDeviceGetDriver(Device));
         PtpFilterReadSettings(driverContext);
-		PtpFilterSetHapticFeedback(Device, driverContext->FeedbackClick, driverContext->FeedbackRelease);
+
     }
 
     RtlZeroMemory(hidPacketBuffer, sizeof(hidPacketBuffer));
@@ -720,14 +692,22 @@ PtpFilterConfigureMultiTouch(
     // God-damn-it we have to configure it by ourselves :)
     pConfigIrp->UserBuffer = pHidPacket;
 
-    WDF_REQUEST_SEND_OPTIONS_INIT(&configRequestSendOptions, WDF_REQUEST_SEND_OPTION_SYNCHRONOUS);
+    WDF_REQUEST_SEND_OPTIONS_INIT(&configRequestSendOptions,
+        WDF_REQUEST_SEND_OPTION_SYNCHRONOUS | WDF_REQUEST_SEND_OPTION_TIMEOUT);
+    WDF_REQUEST_SEND_OPTIONS_SET_TIMEOUT(&configRequestSendOptions, WDF_REL_TIMEOUT_IN_MS(500));
     if (WdfRequestSend(configRequest, deviceContext->HidIoTarget, &configRequestSendOptions) == FALSE) {
         status = WdfRequestGetStatus(configRequest);
         TraceEvents(TRACE_LEVEL_ERROR, TRACE_DEVICE, "%!FUNC! WdfRequestSend failed, Status = %!STATUS!", status);
         goto cleanup;
     } else {
         TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Changed trackpad status to multitouch mode");
-        status = STATUS_SUCCESS;
+        status = WdfRequestGetStatus(configRequest);
+        if (NT_SUCCESS(status) && deviceContext->VendorID == HID_VID_APPLE_BT) {
+            NTSTATUS clickStatus = PtpFilterFirstClickApply(deviceContext);
+            if (!NT_SUCCESS(clickStatus)) {
+                TraceEvents(TRACE_LEVEL_WARNING, TRACE_DEVICE, "%!FUNC! Click pressure configuration failed: %!STATUS!", clickStatus);
+            }
+        }
     }
 
 cleanup:
@@ -736,7 +716,44 @@ cleanup:
     }
 exit:
     TraceEvents(TRACE_LEVEL_INFORMATION, TRACE_DEVICE, "%!FUNC! Exit, Status = %!STATUS!", status);
+    WdfWaitLockRelease(deviceContext->FirstClickLock);
     return status;
+}
+
+static VOID
+PtpFilterStopInput(WDFDEVICE Device)
+{
+    PDEVICE_CONTEXT context = PtpFilterGetContext(Device);
+    InterlockedExchange(&context->PowerStopping, 1);
+    if (context->HidTransportRecoveryTimer != NULL)
+        WdfTimerStop(context->HidTransportRecoveryTimer, FALSE);
+    if (context->InputWorkItem != NULL) PtpFilterInputStop(Device);
+    if (context->HidTransportRecoveryTimer != NULL)
+        WdfTimerStop(context->HidTransportRecoveryTimer, FALSE);
+    if (context->FirstClickLock != NULL) {
+        WdfWaitLockAcquire(context->FirstClickLock, NULL);
+        PtpFilterFirstClickStop(context);
+        WdfWaitLockRelease(context->FirstClickLock);
+    }
+}
+
+NTSTATUS
+PtpFilterSelfManagedIoSuspend(WDFDEVICE Device)
+{
+    PtpFilterStopInput(Device);
+    return STATUS_SUCCESS;
+}
+
+VOID
+PtpFilterSelfManagedIoCleanup(WDFDEVICE Device)
+{
+    PtpFilterStopInput(Device);
+    WDFDRIVER driver = WdfDeviceGetDriver(Device);
+    PDRIVER_CONTEXT context = PtpFilterDriverGetContext(driver);
+    if (context->CDFirstDevice == Device) {
+        PtpFilterDeleteControlDevice(driver);
+        context->CDFirstDevice = NULL;
+    }
 }
 
 VOID

@@ -138,4 +138,5 @@ PtpFilterReadSettings(
 	DriverContext->PalmRejection = PtpFilterReadSettingValue(L"PalmRejection", 0) ? TRUE : FALSE;
 	DriverContext->FeedbackClick = PtpFilterReadSettingValue(L"FeedbackClick", 0x08081E);
 	DriverContext->FeedbackRelease = PtpFilterReadSettingValue(L"FeedbackRelease", 0x020218);
+	DriverContext->FirstClickPressure = PtpFilterReadSettingValue(L"FirstClickPressure", 0);
 }

@@ -14,6 +14,7 @@
 //
 #define CONTROLPANEL_CMD_RELOAD_SETTINGS    0x00
 #define CONTROLPANEL_CMD_GET_BATTERY_LEVEL  0x01
+#define CONTROLPANEL_CMD_GET_PRESSURE_STATUS 0x02
 
 //
 // Response status bytes.
@@ -171,7 +172,8 @@ AmtPtpControlPanelPipeThread(
     OVERLAPPED      ov;
     BOOL            connected;
     UCHAR           requestByte = 0;
-    UCHAR           response[2] = { 0 };
+    UCHAR           response[12] = { 0 };
+    DWORD           responseLength;
     DWORD           bytesRead = 0;
     DWORD           bytesWritten = 0;
 
@@ -284,16 +286,11 @@ AmtPtpControlPanelPipeThread(
         //
         // Dispatch the command.
         //
+        responseLength = 2;
         switch (requestByte) {
         case CONTROLPANEL_CMD_RELOAD_SETTINGS:
         {
-            ULONG feedbackClick = ReadSettingValue(L"FeedbackClick", 0x08081E);
-            ULONG feedbackRelease = ReadSettingValue(L"FeedbackRelease", 0x020218);
-            NTSTATUS st = AmtPtpSetHapticFeedback(devCtx, feedbackClick, feedbackRelease);
-
-            if (NT_SUCCESS(st)) {
-                devCtx->PrevPtpReportAuxAndSettingsInited = FALSE;
-            }
+            NTSTATUS st = AmtPtpFirstClickApply(devCtx);
 
             response[0] = NT_SUCCESS(st)
                 ? CONTROLPANEL_STATUS_OK
@@ -312,6 +309,25 @@ AmtPtpControlPanelPipeThread(
             response[1] = level;
             break;
         }
+        case CONTROLPANEL_CMD_GET_PRESSURE_STATUS:
+        {
+            ULONG snapshot = (ULONG)InterlockedCompareExchange(&devCtx->FirstClickStatus, 0, 0);
+            response[0] = CONTROLPANEL_STATUS_OK;
+            response[1] = 2;
+            response[2] = (UCHAR)snapshot;
+            response[3] = (UCHAR)(snapshot >> 8);
+            response[4] = (UCHAR)(snapshot >> 16);
+            response[5] = (UCHAR)(snapshot >> 24);
+            response[6] = 0;
+            response[7] = 0;
+            ULONG lastStatus = (ULONG)InterlockedCompareExchange(&devCtx->FirstClickLastStatus, 0, 0);
+            response[8] = (UCHAR)lastStatus;
+            response[9] = (UCHAR)(lastStatus >> 8);
+            response[10] = (UCHAR)(lastStatus >> 16);
+            response[11] = (UCHAR)(lastStatus >> 24);
+            responseLength = sizeof(response);
+            break;
+        }
         default:
             response[0] = CONTROLPANEL_STATUS_UNKNOWN;
             response[1] = 0;
@@ -325,7 +341,7 @@ AmtPtpControlPanelPipeThread(
         ov.hEvent = ioEvent;
         ResetEvent(ioEvent);
 
-        if (!WriteFile(hPipe, response, sizeof(response), &bytesWritten, &ov)) {
+        if (!WriteFile(hPipe, response, responseLength, &bytesWritten, &ov)) {
             DWORD err = GetLastError();
 
             if (err == ERROR_IO_PENDING) {

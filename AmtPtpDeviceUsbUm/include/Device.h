@@ -8,6 +8,8 @@ typedef struct _PTP_REPORT_AUX {
 	UCHAR		TipSwitch;
 } PTP_REPORT_AUX, * PPTP_REPORT_AUX;
 
+#include "../../Common/FirstClick.h"
+
 // Device context struct
 typedef struct _DEVICE_CONTEXT
 {
@@ -41,6 +43,19 @@ typedef struct _DEVICE_CONTEXT
 	BOOL                        IgnoreButtonFinger;
 	BOOL                        IgnoreNearFingers;
 	BOOL                        PalmRejection;
+	volatile LONG               SettingsGeneration;
+	LONG                        AppliedSettingsGeneration;
+	WDFWAITLOCK                 FirstClickLock;
+	WDFIOTARGET                 ActuatorTarget;
+	volatile LONG               ActuatorAvailable;
+	BOOL                        HostClick;
+	BOOL                        FirstClickButtonDisabled;
+	UCHAR                       FirstClickPressure;
+	FIRST_CLICK_PHASE           FirstClickPhase;
+	ULONG                       FirstClickFeedback;
+	ULONG                       FirstClickReleaseFeedback;
+	volatile LONG               FirstClickStatus;
+	volatile LONG               FirstClickLastStatus;
 
 	//
 	// Battery-level named-pipe server
@@ -122,6 +137,12 @@ AmtPtpSetHapticFeedback(
 	_In_ ULONG FeedbackClick,
 	_In_ ULONG FeedbackRelease
 );
+
+NTSTATUS AmtPtpFirstClickInitialize(_In_ PDEVICE_CONTEXT Context);
+NTSTATUS AmtPtpFirstClickApply(_In_ PDEVICE_CONTEXT Context);
+VOID AmtPtpFirstClickStop(_In_ PDEVICE_CONTEXT Context);
+UCHAR AmtPtpFirstClickUpdate(_In_ PDEVICE_CONTEXT Context, _In_ UCHAR Pressure,
+	_In_ BOOL HasContact, _In_ UCHAR NativeButton);
 
 _IRQL_requires_(PASSIVE_LEVEL)
 ULONG ReadSettingValue(

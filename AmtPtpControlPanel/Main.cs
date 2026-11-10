@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Data;
@@ -22,9 +22,40 @@ namespace AmtPtpControlPanel
 {
     public partial class Main : Form
     {
+        private readonly CheckBox firstClickEnabled = new CheckBox { AutoSize = true, Text = "Custom click pressure:" };
+        private readonly TextBox firstClickPressure = new TextBox { Text = "24", Width = 45, Enabled = false };
+        private bool firstClickConfigured;
+
         public Main()
         {
             InitializeComponent();
+            InitializeFirstClickControls();
+        }
+
+        private void InitializeFirstClickControls()
+        {
+            int insertionTop = ctlTouchpadSettings.Top;
+            var group = new GroupBox
+            {
+                Name = "firstClickGroup",
+                Text = "Click pressure",
+                Location = new Point(groupBox4.Left, insertionTop),
+                Width = groupBox4.Width,
+                Height = Font.Height * 4
+            };
+            int shift = group.Height + 12;
+            foreach (Control control in Controls)
+                if (control.Top >= insertionTop)
+                    control.Top += shift;
+            ClientSize = new Size(ClientSize.Width, ClientSize.Height + shift);
+
+            firstClickEnabled.Location = new Point(12, Font.Height + 8);
+            group.Controls.Add(firstClickEnabled);
+            firstClickPressure.Location = new Point(firstClickEnabled.Right + 8, firstClickEnabled.Top - 2);
+            group.Controls.Add(firstClickPressure);
+            Controls.Add(group);
+            firstClickEnabled.CheckedChanged += (sender, args) =>
+                firstClickPressure.Enabled = firstClickEnabled.Checked;
         }
 
         private void ctlTouchpadSettings_Click(object sender, EventArgs e)
@@ -43,8 +74,14 @@ namespace AmtPtpControlPanel
             using (new ButtonWait((Button)sender))
                 if (SaveSettings())
                 {
-                    UsbDevice.ReloadSettings();
-                    BtDevice.SendIoctl(BtDevice.IOCTL_RELOAD_SETTINGS);
+                    bool applyPressure = firstClickEnabled.Checked || firstClickConfigured;
+                    bool usbApplied = UsbDevice.ReloadSettings();
+                    bool btApplied = BtDevice.SendIoctl(BtDevice.IOCTL_RELOAD_SETTINGS);
+                    bool applied = usbApplied || btApplied;
+                    if (!applied && applyPressure)
+                        MessageBox.Show("Could not apply click pressure.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    if (applied)
+                        firstClickConfigured = firstClickEnabled.Checked;
                 }
         }
 
@@ -123,10 +160,12 @@ namespace AmtPtpControlPanel
             Int32 ignoreButtonFinger = 1;
             Int32 ignoreNearFingers = 1;
             Int32 palmRejection = 1;
+            Int32 pressPressure = 0;
 
             try
             {
-                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\AmtPtpDeviceUsbUm\Parameters"))
+                using (RegistryKey key = Registry.LocalMachine.OpenSubKey(@"SOFTWARE\Microsoft\Windows NT\CurrentVersion\WUDF\Services\AmtPtpDeviceUsbUm\Parameters") ??
+                    Registry.LocalMachine.OpenSubKey(@"SYSTEM\CurrentControlSet\Services\AmtPtpHidFilter\Parameters"))
                 {
                     delStringRefInt32Void get = (string name, ref Int32 output) =>
                     {
@@ -147,6 +186,7 @@ namespace AmtPtpControlPanel
                     get("IgnoreButtonFinger", ref ignoreButtonFinger);
                     get("IgnoreNearFingers", ref ignoreNearFingers);
                     get("PalmRejection", ref palmRejection);
+                    get("FirstClickPressure", ref pressPressure);
                 }
             }
             catch
@@ -191,10 +231,26 @@ namespace AmtPtpControlPanel
 
             if (palmRejection != 0)
                 ctlPalmRejection.Checked = true;
+
+            firstClickConfigured = pressPressure >= 2 && pressPressure <= 255;
+            firstClickPressure.Text = firstClickConfigured ? pressPressure.ToString() : "24";
+            firstClickEnabled.Checked = firstClickConfigured;
         }
 
         private bool SaveSettings()
         {
+            Int32 pressPressure = 0;
+            if (firstClickEnabled.Checked &&
+                (!Int32.TryParse(firstClickPressure.Text, out pressPressure) || pressPressure < 2 || pressPressure > 255))
+            {
+                MessageBox.Show("Click pressure must be between 2 and 255.", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
+            if (firstClickEnabled.Checked && ctlDisableFeedback.Checked)
+            {
+                MessageBox.Show("Enable clicking before adjusting click pressure.", "Click pressure", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
             Int32 buttonDisabled = 0;
             Int32 feedbackClick = 0x060617;
             Int32 feedbackRelease = 0x000014;
@@ -275,6 +331,7 @@ namespace AmtPtpControlPanel
                         keyParameters.SetValue("IgnoreButtonFinger", ignoreButtonFinger);
                         keyParameters.SetValue("IgnoreNearFingers", ignoreNearFingers);
                         keyParameters.SetValue("PalmRejection", palmRejection);
+                        keyParameters.SetValue("FirstClickPressure", pressPressure);
                     }
                 };
 
@@ -495,47 +552,52 @@ namespace AmtPtpControlPanel
         private const byte StatusFail = 0xFF;
         private const byte StatusUnknown = 0xFE;
 
-        private static object Send(byte cmd)
+        private static async Task<byte[]> ExchangeAsync(byte cmd)
         {
-            try
+            using (var timeout = new CancellationTokenSource(750))
+            using (var pipe = new NamedPipeClientStream(".", PipeName, PipeDirection.InOut, PipeOptions.Asynchronous))
+            using (timeout.Token.Register(() => pipe.Dispose()))
             {
-                using (var pipe = new NamedPipeClientStream(
-                    ".", PipeName, PipeDirection.InOut))
+                try
                 {
-                    pipe.Connect(250);
-
-                    // Send command byte.
-                    pipe.WriteByte(cmd);
-                    pipe.Flush();
-
-                    // Read 2-byte response [status][payload].
+                    await pipe.ConnectAsync(250, timeout.Token).ConfigureAwait(false);
+                    await pipe.WriteAsync(new[] { cmd }, 0, 1, timeout.Token).ConfigureAwait(false);
                     var response = new byte[2];
                     int read = 0;
                     while (read < response.Length)
                     {
-                        int n = pipe.Read(response, read, response.Length - read);
-                        if (n <= 0)
+                        int count = await pipe.ReadAsync(response, read, response.Length - read, timeout.Token).ConfigureAwait(false);
+                        if (count == 0)
                             throw new IOException("Pipe closed before full response.");
-                        read += n;
+                        read += count;
                     }
+                    return response;
+                }
+                catch (ObjectDisposedException) when (timeout.IsCancellationRequested)
+                {
+                    throw new OperationCanceledException(timeout.Token);
+                }
+            }
+        }
 
-                    if (read != 2)
-                        throw new IOException("Invalid size of response.");
+        private static object Send(byte cmd)
+        {
+            try
+            {
+                byte[] response = ExchangeAsync(cmd).GetAwaiter().GetResult();
+                byte status = response[0];
+                byte payload = response[1];
 
-                    byte status = response[0];
-                    byte payload = response[1];
-
-                    switch (status)
-                    {
-                        case StatusOk:
-                            return cmd == CmdGetBattery ? (object)(uint)payload : null;
-                        case StatusFail:
-                            return "Driver reported failure.";
-                        case StatusUnknown:
-                            return "Driver reported unknown command.";
-                        default:
-                            return $"Unexpected status 0x{status:X2}.";
-                    }
+                switch (status)
+                {
+                    case StatusOk:
+                        return cmd == CmdGetBattery ? (object)(uint)payload : null;
+                    case StatusFail:
+                        return "Driver reported failure.";
+                    case StatusUnknown:
+                        return "Driver reported unknown command.";
+                    default:
+                        return $"Unexpected status 0x{status:X2}.";
                 }
             }
             catch (TimeoutException)

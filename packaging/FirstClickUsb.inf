@@ -1,0 +1,61 @@
+[Version]
+Signature = "$WINDOWS NT$"
+Class = HIDClass
+ClassGuid = {745a17a0-74d3-11d0-b6fe-00a0c90f57da}
+Provider = %ManufacturerName%
+CatalogFile = FirstClickUsb.cat
+DriverVer = 11/10/2026,2026.3982.3.1
+PnpLockdown = 1
+
+[DestinationDirs]
+DriverFiles = 13
+
+[SourceDisksNames]
+1 = %DiskName%,,,""
+
+[SourceDisksFiles]
+AmtPtpDeviceUsbUm.dll = 1
+
+[Manufacturer]
+%ManufacturerName% = Models,NTamd64.10.0...22000
+
+[Models.NTamd64.10.0...22000]
+%DeviceDescription% = FirstClick_Install,USB\VID_05AC&PID_0265&MI_01
+
+[FirstClick_Install.NT]
+CopyFiles = DriverFiles
+Include = MsHidUmdf.inf,WUDFRD.inf
+Needs = MsHidUmdf.NT,WUDFRD.NT
+
+[FirstClick_Install.NT.Services]
+Include = MsHidUmdf.inf,WUDFRD.inf
+Needs = MsHidUmdf.NT.Services,WUDFRD.NT.Services
+
+[FirstClick_Install.NT.HW]
+AddReg = FirstClick_Hardware
+
+[FirstClick_Install.NT.Wdf]
+UmdfDispatcher = NativeUSB
+UmdfService = AmtPtpDeviceUsbUm,FirstClick_Service
+UmdfServiceOrder = AmtPtpDeviceUsbUm
+UmdfKernelModeClientPolicy = AllowKernelModeClients
+UmdfFileObjectPolicy = AllowNullAndUnknownFileObjects
+UmdfMethodNeitherAction = Copy
+UmdfFsContextUsePolicy = CanUseFsContext2
+UmdfHostPriority = PriorityHigh
+
+[FirstClick_Service]
+UmdfLibraryVersion = 2.15.0
+ServiceBinary = %13%\AmtPtpDeviceUsbUm.dll
+
+[FirstClick_Hardware]
+HKR,,FriendlyName,,%DeviceDescription%
+HKR,,LowerFilters,0x00010008,"WUDFRd"
+
+[DriverFiles]
+AmtPtpDeviceUsbUm.dll
+
+[Strings]
+ManufacturerName = "Local Magic Trackpad First Click"
+DeviceDescription = "Magic Trackpad 2 First Click Pressure (USB)"
+DiskName = "Magic Trackpad 2 First Click Pressure"
